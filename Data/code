@@ -1,0 +1,173 @@
+def handle_interrupt(signal, frame):
+    print("Script interrupted by user")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_interrupt)
+
+def pred_sentiment_safety_effectiveness(post: str) -> dict:
+    """Retrieve a response from OpenAI given a post."""
+
+    system_prompt = """
+        I'm monitoring social media discussions to understand public attitudes towards the mRNA technology / vaccine. Please help me classify the provided Twitter post about the mRNA technology / vaccine.
+        
+        Here are the definition of safety, effectiveness, importance and trust in authority
+        (1) Safety:
+        - Safe: mRNA technology / vaccine is safe and reliable (with no adverse reactions, etc.)
+        - Unsafe: Doubt about the safety of the mRNA technology / vaccine, or believe that the mRNA technology / vaccine is unsafe (including concerns about possible adverse reactions, or damage to health, etc.)
+        (2) Effectiveness:
+        - Effective: mRNA technology / vaccine is effective, to produce antibodies, or to prevent COVID-19 (or other disease), etc. (positive attitudes towards effectiveness)
+        - Ineffective: Doubt about the effectiveness of the mRNA technology / vaccine, or believe that the mRNA technology / vaccine is ineffective, unable to produce antibodies or prevent COVID-19 (or other disease), etc. (negative attitudes towards of effectiveness)
+        (3) Importance
+        - Important: mRNA technology / vaccine is important, necessary or needed
+        - Unimportant: mRNA technology / vaccine is unimportant, unnecessary or unneeded
+        (4) Trust in authority
+        - Trust: Trust in government or policy-makers (including all-level government, ministry of health, CDC, etc) 
+        - Distrust: Doubt or distrust in government or policy-makers (including all-level government, ministry of health, CDC, etc)
+
+        The desired output should be in JSON format:
+        {
+            "sentiment": "positive/neutral/negative",
+            "is_misinformation": "true/false/not sure",
+            "safety": "safe/unsafe/irrelevant",
+            "effectiveness": "effective/ineffective/irrelevant",
+            "importance": "important/unimportant/irrelevant",
+            "trust": "trust/distrust/irrelevant"
+        }
+    """
+
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"tweet: {post}"}
+            ],
+            max_tokens=200,
+            temperature=0.7,
+        )
+        return json.loads(completion.choices[0].message.content), completion.usage.total_tokens
+    except:
+        print(f"{post} has error!")
+        return {
+            "sentiment": "error",
+            "is_misinformation": "error",
+            "safety": "error",
+            "effectiveness": "error",
+            "importance": "error",
+            "trust": "error",
+        }, 0
+
+def function_with_timeout(func, timeout=10, *args, **kwargs):
+    results = {}
+    exception = None
+
+    def target():
+        nonlocal results, exception
+        try:
+            results["data"] = func(*args, **kwargs)
+        except Exception as e:
+            exception = e
+
+    # Create thread
+    thread = threading.Thread(target=target)
+    # Start thread
+    thread.start()
+    # Wait for it to complete or for the timeout to elapse
+    thread.join(timeout=timeout)
+    # If thread is still alive, it means it didn't finish within the timeout
+    if thread.is_alive():
+        raise TimeoutError(f"Function exceeded {timeout} seconds.")
+    if exception:
+        raise exception
+    return results["data"]
+
+def get_error_values():
+    error_values = {
+        'sentiment': 'error',
+        'is_misinformation': 'error',
+        'safety': 'error',
+        'effectiveness': 'error',
+        'importance': 'error',
+        'trust': 'error',
+        'tokens': 'error'
+    }
+    return error_values
+    
+
+def process_file(file_path, save_folder):
+    # Read data
+    df = pd.read_csv(file_path)
+    sample_size = df.shape[0]
+
+    sampled_df = df.sample(n=sample_size, random_state=1234)
+
+    posts = sampled_df['Hit Sentence'].values
+    
+    # Initialize the dictionary to store predictions
+    predictions = {
+        'sentiment': [],
+        'is_misinformation': [],
+        'safety': [],
+        'effectiveness': [],
+        'importance': [],
+        'trust': []
+    }
+
+    tokens_list = []
+
+    for post in tqdm(posts, desc="Predicting"):
+        try:
+            pred_result, tokens = function_with_timeout(pred_sentiment_safety_effectiveness, 20, post)
+            for key, value in pred_result.items():
+                predictions[key].append(value)
+            tokens_list.append(tokens)
+        except (TimeoutError, Exception) as e:
+            error_values = get_error_values()
+            for key, value in error_values.items():
+                if key == "tokens":
+                    tokens_list.append(value)
+                else:
+                    predictions[key].append(value)
+            print(f"Error on post: {post}. Reason: {e}")
+
+    # Create a new DataFrame with original posts and predictions
+    results_df = pd.DataFrame({
+        'Hit Sentence': posts,
+        'Predicted_sentiment': predictions['sentiment'],
+        'Predicted_misinformation': predictions['is_misinformation'],
+        'Predicted_safety': predictions['safety'],
+        'Predicted_effectiveness': predictions['effectiveness'],
+        'Predicted_importance': predictions['importance'],
+        'Predicted_trust': predictions['trust'],
+        "total tokens": tokens_list
+    })
+
+
+    # Create the save path dynamically
+    base_name = os.path.basename(file_path).replace('.csv', '_pred.csv')
+    save_path = os.path.join(save_folder, base_name)
+    
+    results_df.to_csv(save_path, index=False)
+
+def main(args):
+    # Ensure the save directory exists
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    # Loop through all files in the directory
+    for file_name in os.listdir(args.input_folder):
+        if file_name.endswith('.csv'):
+            file_path = os.path.join(args.input_folder, file_name)
+            process_file(file_path, args.output_folder)
+            
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Process CSV data in a folder with OpenAI.')
+    parser.add_argument('--api_key', type=str, help='OpenAI API key')
+    parser.add_argument('--input_folder', type=str,
+                        default="./input_folder", help='Path to the folder containing input CSV files')
+    parser.add_argument('--output_folder', type=str, default='./mRNA_prediction_results',
+                        help='Path to the folder where the output CSV files should be saved.')
+
+    args = parser.parse_args()
+    openai.api_key = args.api_key
+    main(args)
